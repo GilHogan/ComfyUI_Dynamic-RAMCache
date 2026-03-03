@@ -1,6 +1,10 @@
 import gc
 import logging
 import time
+import psutil
+import ctypes
+from ctypes import wintypes
+import sys
 
 caching = None
 execution = None
@@ -27,6 +31,42 @@ except ImportError:
 if execution is None or caching is None:
     logging.error("[DynamicRAMCache] Critical module import failed, plugin may not work correctly")
     logging.error("[DynamicRAMCache] Plugin compatibility with ComfyUI 2025.10.31 needs to be verified. Module structure may have changed.")
+
+# Windows API for accurate Committed Memory detection
+class PERFORMANCE_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ('cb', wintypes.DWORD),
+        ('CommitTotal', ctypes.c_size_t),
+        ('CommitLimit', ctypes.c_size_t),
+        ('CommitPeak', ctypes.c_size_t),
+        ('PhysicalTotal', ctypes.c_size_t),
+        ('PhysicalAvailable', ctypes.c_size_t),
+        ('SystemCache', ctypes.c_size_t),
+        ('KernelTotal', ctypes.c_size_t),
+        ('KernelPaged', ctypes.c_size_t),
+        ('KernelNonpaged', ctypes.c_size_t),
+        ('PageSize', ctypes.c_size_t),
+        ('HandleCount', wintypes.DWORD),
+        ('ProcessCount', wintypes.DWORD),
+        ('ThreadCount', wintypes.DWORD),
+    ]
+
+def get_free_commit_gb():
+    """Get available memory headroom in GB (Win: Commit, Linux: Available RAM)"""
+    if sys.platform == 'win32':
+        try:
+            psapi = ctypes.windll.psapi
+            perf_info = PERFORMANCE_INFORMATION()
+            perf_info.cb = ctypes.sizeof(PERFORMANCE_INFORMATION)
+            if psapi.GetPerformanceInfo(ctypes.byref(perf_info), perf_info.cb):
+                page_size = perf_info.PageSize
+                free_commit_bytes = (perf_info.CommitLimit - perf_info.CommitTotal) * page_size
+                return free_commit_bytes / (1024**3)
+        except Exception as e:
+            logging.debug(f"[DynamicRAMCache] Windows API GetPerformanceInfo failed: {e}")
+    
+    # On Linux, virtual_memory().available is the most accurate indicator of pressure
+    return psutil.virtual_memory().available / (1024**3)
 
 class AlwaysEqualProxy(str):
     def __eq__(self, _):
@@ -238,6 +278,97 @@ class RAMCacheExtremeCleanup(DynamicRAMCacheControl):
                         old_mode = "CLASSIC (No Eviction)"
                     self._execute_cache_logic("RAM_PRESSURE (Auto Purge)", purge_threshold)
                     self._execute_cache_logic(old_mode, old_ram_arg)
+        else:
+            logging.warning("[DynamicRAMCache] Plugin disabled: Missing internal modules.")
+
+        if any_input is not None:
+            return (any_input,)
+        else:
+            try:
+                from comfy_execution.graph import ExecutionBlocker
+                return (ExecutionBlocker(None),)
+            except ImportError:
+                return (None,)
+
+
+class SmartRAMCacheCleanup(DynamicRAMCacheControl):
+    _is_cleaning_in_progress = False
+    _last_cleaned_timestamp = 0.0
+    COOLDOWN_SECONDS = 2.0 
+
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "purge_threshold": ("FLOAT", {"default": 256.0, "min": 0.1, "step": 0.1, "tooltip": "Threshold used during purge (GB)"}),
+                "min_free_ram_gb": ("FLOAT", {"default": 2.0, "min": 0.0, "step": 0.1, "tooltip": "Trigger purge if free RAM is below this (GB)"}),
+                "min_commit_free_gb": ("FLOAT", {"default": 2.0, "min": 0.0, "step": 0.1, "tooltip": "Trigger purge if free Commit is below this (GB)"}),
+            },
+            "optional": {
+                "any_input": (any_type, {}),
+            }
+        }
+
+    RETURN_TYPES = (any_type,)
+    RETURN_NAMES = ("output_passthrough",)
+    FUNCTION = "smart_cleanup"
+    CATEGORY = "utils/dynamic_ramcache"
+
+    def smart_cleanup(self, purge_threshold, min_free_ram_gb, min_commit_free_gb, any_input=None):
+        if SmartRAMCacheCleanup._is_cleaning_in_progress:
+            return (any_input,) if any_input is not None else (None,)
+
+        current_time = time.time()
+        if (current_time - SmartRAMCacheCleanup._last_cleaned_timestamp) < SmartRAMCacheCleanup.COOLDOWN_SECONDS:
+            return (any_input,) if any_input is not None else (None,)
+
+        if caching is not None and execution is not None:
+            # 获取当前内存状态
+            vm = psutil.virtual_memory()
+            free_ram_gb = vm.available / (1024**3)
+            
+            # 使用准确的 Windows Commit 检测逻辑
+            free_commit_gb = get_free_commit_gb()
+
+            needs_cleanup = False
+
+            logging.info(f"[DynamicRAMCache] : Free RAM ({free_ram_gb:.2f}GB), Free Commit ({free_commit_gb:.2f}GB)")
+            if min_free_ram_gb > 0 and free_ram_gb < min_free_ram_gb:
+                logging.info(f"[DynamicRAMCache] ⚠️ Smart Cleanup Triggered: Free RAM ({free_ram_gb:.2f}GB) < {min_free_ram_gb}GB")
+                needs_cleanup = True
+            elif min_commit_free_gb > 0 and free_commit_gb < min_commit_free_gb:
+                logging.info(f"[DynamicRAMCache] ⚠️ Smart Cleanup Triggered: Free Commit ({free_commit_gb:.2f}GB) < {min_commit_free_gb}GB")
+                needs_cleanup = True
+
+            if needs_cleanup:
+                SmartRAMCacheCleanup._is_cleaning_in_progress = True
+                try:
+                    executor = self._find_executor()
+                    if executor is None:
+                        logging.warning("[DynamicRAMCache] PromptExecutor not found.")
+                    else:
+                        if not hasattr(executor, 'cache_args'):
+                            executor.cache_args = {}
+                        old_ram_arg = executor.cache_args.get('ram', 2.0)
+                        cache_set = self._get_cache_set(executor)
+                        if cache_set is not None:
+                            RAMPressureCacheClass = getattr(caching, 'RAMPressureCache', None)
+                            if RAMPressureCacheClass:
+                                is_currently_ram = isinstance(cache_set.outputs, RAMPressureCacheClass)
+                                old_mode = "RAM_PRESSURE (Auto Purge)" if is_currently_ram else "CLASSIC (No Eviction)"
+                            else:
+                                old_mode = "CLASSIC (No Eviction)"
+                            
+                            # 临时调高阈值强制触发清理
+                            self._execute_cache_logic("RAM_PRESSURE (Auto Purge)", purge_threshold)
+                            # 恢复原有模式和阈值
+                            self._execute_cache_logic(old_mode, old_ram_arg)
+                finally:
+                    SmartRAMCacheCleanup._is_cleaning_in_progress = False
+                    SmartRAMCacheCleanup._last_cleaned_timestamp = time.time()
         else:
             logging.warning("[DynamicRAMCache] Plugin disabled: Missing internal modules.")
 
