@@ -5,6 +5,13 @@ import psutil
 import ctypes
 from ctypes import wintypes
 import sys
+import threading
+
+try:
+    import server
+except ImportError:
+    logging.warning("[DynamicRAMCache] 无法导入 server 模块，UI 通知功能可能受限")
+
 
 caching = None
 execution = None
@@ -408,6 +415,125 @@ class SmartRAMCacheCleanup(DynamicRAMCacheControl):
                     SmartRAMCacheCleanup._last_cleaned_timestamp = time.time()
         else:
             logging.warning("[DynamicRAMCache] Plugin disabled: Missing internal modules.")
+
+        if any_input is not None:
+            return (any_input,)
+        else:
+            try:
+                from comfy_execution.graph import ExecutionBlocker
+                return (ExecutionBlocker(None),)
+            except ImportError:
+                return (None,)
+
+# ==============================================================================
+# Global Background Monitor Implementation
+# ==============================================================================
+
+GLOBAL_MONITOR_THREAD = None
+MONITOR_STOP_EVENT = threading.Event()
+GLOBAL_CLEANUP_REQUIRED = False
+GLOBAL_MONITOR_CONFIG = {
+    "enabled": False,
+    "offset_gb": 2.0,
+    "action": "Notify & Purge",
+    "interval": 2.0
+}
+
+original_send_sync = None
+
+def perform_main_thread_cleanup():
+    try:
+        dummy_instance = RAMCacheExtremeCleanup()
+        dummy_instance.extreme_cleanup(256.0)
+        logging.info("[DynamicRAMCache] 🛡️ 全局监控已在主线程安全完成内存清理")
+    except Exception as e:
+        logging.error(f"[DynamicRAMCache] 全局清理失败: {e}")
+
+def hooked_send_sync(self, event, data=None, sid=None):
+    global GLOBAL_CLEANUP_REQUIRED
+    
+    if GLOBAL_CLEANUP_REQUIRED and event in ["executing", "progress", "execution_start"]:
+        GLOBAL_CLEANUP_REQUIRED = False
+        perform_main_thread_cleanup()
+        
+    if original_send_sync is not None:
+        return original_send_sync(self, event, data, sid)
+
+if "server" in sys.modules and hasattr(sys.modules["server"], "PromptServer"):
+    server_module = sys.modules["server"]
+    if original_send_sync is None:
+        original_send_sync = getattr(server_module.PromptServer, "send_sync", None)
+        if original_send_sync is not None:
+            server_module.PromptServer.send_sync = hooked_send_sync
+
+def ram_monitor_loop():
+    while not MONITOR_STOP_EVENT.is_set():
+        if not GLOBAL_MONITOR_CONFIG["enabled"]:
+            time.sleep(1.0)
+            continue
+            
+        try:
+            # 严格使用纯物理可用内存（不含虚拟内存）
+            vm = psutil.virtual_memory()
+            free_gb = vm.available / (1024**3)
+            
+            offset = GLOBAL_MONITOR_CONFIG["offset_gb"]
+            action = GLOBAL_MONITOR_CONFIG["action"]
+            
+            if free_gb < offset:
+                msg = f"⚠️ 物理内存警告: 当前剩余 {free_gb:.2f}GB (阈值 {offset}GB)"
+                
+                if "Notify" in action:
+                    logging.warning(f"[DynamicRAMCache] {msg}")
+                
+                if "Purge" in action:
+                    global GLOBAL_CLEANUP_REQUIRED
+                    GLOBAL_CLEANUP_REQUIRED = True
+                    
+        except Exception as e:
+            logging.debug(f"[DynamicRAMCache] 监控线程错误: {e}")
+            
+        time.sleep(GLOBAL_MONITOR_CONFIG["interval"])
+
+class GlobalPhysicalRAMMonitor:
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "enable_monitor": ("BOOLEAN", {"default": True, "tooltip": "是否开启全局后台监控"}),
+                "min_free_ram_offset_gb": ("FLOAT", {"default": 2.0, "min": 0.5, "step": 0.1, "tooltip": "触发阈值：当可用物理内存低于此值时触发"}),
+                "action": (["Notify Only", "Notify & Purge", "Silent Purge"], {"default": "Notify & Purge"}),
+                "check_interval_seconds": ("FLOAT", {"default": 2.0, "min": 0.5, "max": 10.0, "step": 0.5, "tooltip": "后台轮询检查频率"}),
+            },
+            "optional": {
+                "any_input": (any_type, {}),
+            }
+        }
+
+    RETURN_TYPES = (any_type,)
+    RETURN_NAMES = ("output_passthrough",)
+    FUNCTION = "apply_config"
+    CATEGORY = "utils/dynamic_ramcache"
+
+    def apply_config(self, enable_monitor, min_free_ram_offset_gb, action, check_interval_seconds, any_input=None):
+        global GLOBAL_MONITOR_CONFIG
+        global GLOBAL_MONITOR_THREAD
+        
+        GLOBAL_MONITOR_CONFIG["enabled"] = enable_monitor
+        GLOBAL_MONITOR_CONFIG["offset_gb"] = min_free_ram_offset_gb
+        GLOBAL_MONITOR_CONFIG["action"] = action
+        GLOBAL_MONITOR_CONFIG["interval"] = check_interval_seconds
+        
+        if enable_monitor and (GLOBAL_MONITOR_THREAD is None or not GLOBAL_MONITOR_THREAD.is_alive()):
+            MONITOR_STOP_EVENT.clear()
+            GLOBAL_MONITOR_THREAD = threading.Thread(target=ram_monitor_loop, daemon=True)
+            GLOBAL_MONITOR_THREAD.start()
+            logging.info("[DynamicRAMCache] 🌐 全局后台内存监控已启动")
+        elif not enable_monitor:
+            logging.info("[DynamicRAMCache] 🌐 全局后台内存监控已暂停")
 
         if any_input is not None:
             return (any_input,)
