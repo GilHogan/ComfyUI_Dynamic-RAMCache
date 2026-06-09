@@ -9,8 +9,8 @@ A custom node for ComfyUI that dynamically manages RAM usage by intelligently co
 - **Dual Cache Management Modes**: 
   - CLASSIC (No Eviction): Standard cache behavior with no automatic purging
   - RAM_PRESSURE (Auto Purge): Smart cache purging when system memory falls below the threshold
-- **RAM Cache Extreme Cleanup (🧹)**: Performs a one-time aggressive purge and automatically restores the previous mode and threshold.
-- **Configurable Memory Threshold**: Fine-tune the minimum amount of free RAM to maintain
+- **RAM Cache Extreme Cleanup (🧹)**: Performs a one-time aggressive purge and automatically restores the previous mode and thresholds.
+- **Configurable Memory Thresholds**: Supports the newer `--cache-ram active inactive` RAM threshold pair
 - **Seamless Cache Migration**: Preserves essential cache data when switching between modes
 - **Real-time Memory Monitoring**: Continuously checks system RAM and virtual memory availability
 
@@ -34,7 +34,13 @@ A custom node for ComfyUI that dynamically manages RAM usage by intelligently co
 - **cleanup_threshold**: 
   - Range: 0.1 - 256.0 GB
   - Default: 2.0 GB
-  - Determines the minimum amount of free RAM to maintain (in gigabytes)
+  - Active cache free RAM threshold, matching the first `--cache-ram` value
+
+- **inactive_threshold**:
+  - Range: 0 - 256.0 GB
+  - Default: 0 GB
+  - Inactive cache / pinned memory threshold, matching the optional second `--cache-ram` value
+  - Optional for old workflows. `0` keeps ComfyUI's current value, and older ComfyUI builds ignore it
 
 ### Extreme Cleanup Parameters
 
@@ -44,7 +50,7 @@ A custom node for ComfyUI that dynamically manages RAM usage by intelligently co
   - Temporary headroom used for the one-shot purge
 
 - **restore behavior**:
-  - Automatically restores the mode and threshold that were active before cleanup
+  - Automatically restores the mode and both thresholds that were active before cleanup
 
 3. Connect the node anywhere in your workflow - it will continuously monitor and manage cache based on your settings
 4. Optionally add the "RAMCacheExtremeCleanup" node at the end of a workflow to trigger a one-shot cleanup and restore the previous state
@@ -62,7 +68,7 @@ In CLASSIC mode, the node maintains standard cache behavior without automatic pu
 
 In RAM_PRESSURE mode, the node actively monitors system memory and intelligently purges cache when:
 1. Available system RAM falls below the specified cleanup_threshold
-2. The system is experiencing memory pressure
+2. Inactive cache / pinned memory exceeds the inactive_threshold behavior in newer ComfyUI builds
 
 When purging, it prioritizes removing older, less recently used cache items while attempting to preserve critical data.
 

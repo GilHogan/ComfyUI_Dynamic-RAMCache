@@ -8,7 +8,7 @@
 
 - **动态缓存模式切换**：支持在CLASSIC（无内存回收）和RAM_PRESSURE（自动内存清理）模式之间切换
 - **智能内存管理**：自动监控和清理 RAM 缓存，当内存不足时释放不必要的缓存数据
-- **自定义清理阈值**：允许用户设置最小空闲内存保持量，灵活适应不同硬件配置
+- **自定义清理阈值**：支持新版 `--cache-ram active inactive` 两个 RAM 阈值
 - **无缝数据迁移**：在切换缓存模式时保留现有缓存数据，避免重复计算
 - **直观的节点接口**：简单易用的参数设置，适用于不同水平的用户
 - **极限清理节点**：一次性强清理（包含虚拟内存占用）并自动恢复清理前的模式与阈值
@@ -25,7 +25,8 @@
 1. 在ComfyUI中，从`utils/dynamic_ramcache`类别中添加`DynamicRAMCacheControl`节点
 2. 配置以下参数：
    - **mode**：选择缓存模式（CLASSIC或RAM_PRESSURE）
-   - **cleanup_threshold**：设置最小空闲内存保持量（GB）
+   - **cleanup_threshold**：设置 active cache 空闲内存阈值（GB）
+   - **inactive_threshold**：可选。设置 inactive cache / pinned memory 阈值（GB），填 `0` 或旧工作流缺少此项时沿用 ComfyUI 当前值
 3. 可以选择性地连接任意输入到`any_input`端口（节点会透传此输入）
 4. 可选：在工作流末尾添加`RAMCacheExtremeCleanup`节点，执行一次性清理并恢复之前状态
 5. 运行工作流
@@ -37,16 +38,22 @@
 - **CLASSIC (No Eviction)**：传统缓存模式，不会自动清理缓存，可能导致内存使用持续增长
 - **RAM_PRESSURE (Auto Purge)**：自动内存清理模式，当可用内存低于设定阈值时会自动清理缓存
 
-### cleanup_threshold（清理阈值）
+### cleanup_threshold（active 阈值）
 
 - 类型：浮点数（0.1-256.0 GB）
 - 默认值：2.0 GB
-- 说明：系统尝试维持的最小空闲内存量。当可用内存低于此值时，RAM_PRESSURE模式会触发缓存清理
+- 说明：对应新版 `--cache-ram` 的第一个值。可用内存低于此值时，RAM_PRESSURE模式会清理 active cache
+
+### inactive_threshold（inactive 阈值）
+
+- 类型：浮点数（0-256.0 GB）
+- 默认值：0
+- 说明：对应新版 `--cache-ram` 的第二个值。旧版 ComfyUI 不使用该参数时会自动忽略；`0` 表示不改 ComfyUI 当前值；大于 `0` 时会更新 inactive cache / pinned memory 阈值
 
 ### 极限清理参数
 
 - **purge_threshold**：一次性清理时使用的临时阈值（默认 256.0 GB）
-- **恢复行为**：自动恢复清理前的模式与阈值
+- **恢复行为**：自动恢复清理前的模式、active 阈值和 inactive 阈值
 
 ### 输出
 
@@ -59,7 +66,7 @@
 1. 检测ComfyUI的`PromptExecutor`实例
 2. 根据所选模式在`RAMPressureCache`和`HierarchicalCache`之间切换
 3. 在切换过程中保留现有的缓存数据
-4. 当处于RAM_PRESSURE模式时，监控系统内存并在需要时触发缓存清理
+4. 当处于RAM_PRESSURE模式时，按 active / inactive 两个阈值触发缓存清理
 
 ## 兼容性要求
 
