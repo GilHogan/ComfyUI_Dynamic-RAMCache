@@ -114,16 +114,25 @@ class DynamicRAMCacheControl:
 
         if target_mode_ram and not is_currently_ram:
             self._switch_to_ram_pressure(cache_set, current_cache, caching)
-            self._set_executor_cache_type(executor, target_mode_ram)
-            logging.info(self._format_headroom_log("[DynamicRAMCache] Switched mode: CLASSIC -> RAM_PRESSURE", active_headroom, inactive_headroom, supports_inactive))
+            if self._can_set_executor_ram_type(executor):
+                self._set_executor_cache_type(executor, target_mode_ram)
+                logging.info(self._format_headroom_log("[DynamicRAMCache] Switched mode: CLASSIC -> RAM_PRESSURE", active_headroom, inactive_headroom, supports_inactive))
+            else:
+                logging.warning(self._format_headroom_log("[DynamicRAMCache] RAM_PRESSURE cache active, executor mode kept as CLASSIC to avoid a prompt-local None callback", active_headroom, inactive_headroom, supports_inactive))
 
         elif not target_mode_ram and is_currently_ram:
-            self._switch_to_classic(cache_set, current_cache, caching)
-            self._set_executor_cache_type(executor, target_mode_ram)
-            logging.info(f"[DynamicRAMCache] Switched mode: RAM_PRESSURE -> CLASSIC")
+            if self._should_keep_ram_mode(executor):
+                logging.warning(self._format_headroom_log("[DynamicRAMCache] CLASSIC requested, RAM_PRESSURE kept active to avoid a prompt-local callback mismatch", active_headroom, inactive_headroom, supports_inactive))
+            else:
+                self._switch_to_classic(cache_set, current_cache, caching)
+                self._set_executor_cache_type(executor, target_mode_ram)
+                logging.info(f"[DynamicRAMCache] Switched mode: RAM_PRESSURE -> CLASSIC")
 
         elif target_mode_ram and is_currently_ram:
-            self._set_executor_cache_type(executor, target_mode_ram)
+            if self._can_set_executor_ram_type(executor):
+                self._set_executor_cache_type(executor, target_mode_ram)
+            else:
+                logging.warning(self._format_headroom_log("[DynamicRAMCache] RAM_PRESSURE cache active, executor mode kept as CLASSIC to avoid a prompt-local None callback", active_headroom, inactive_headroom, supports_inactive))
             if old_ram_arg != active_headroom or old_ram_inactive_arg != inactive_headroom:
                 logging.info(self._format_headroom_update_log(old_ram_arg, old_ram_inactive_arg, active_headroom, inactive_headroom, supports_inactive))
 
@@ -179,6 +188,35 @@ class DynamicRAMCacheControl:
             return 'ram_inactive' in inspect.getsource(execute_async)
         except (OSError, TypeError):
             return False
+
+    def _can_set_executor_ram_type(self, executor):
+        if self._is_executor_ram_type(executor):
+            return True
+        return not self._uses_prompt_local_ram_release_callback()
+
+    def _should_keep_ram_mode(self, executor):
+        return self._is_executor_ram_type(executor) and self._uses_prompt_local_ram_release_callback()
+
+    def _is_executor_ram_type(self, executor):
+        CacheType = getattr(execution, 'CacheType', None)
+        if CacheType is None:
+            return False
+
+        ram_type = getattr(CacheType, 'RAM_PRESSURE', None)
+        return ram_type is not None and getattr(executor, 'cache_type', None) == ram_type
+
+    def _uses_prompt_local_ram_release_callback(self):
+        PromptExecutor = getattr(execution, 'PromptExecutor', None)
+        execute_async = getattr(PromptExecutor, 'execute_async', None)
+        if execute_async is None:
+            return True
+
+        try:
+            source = inspect.getsource(execute_async)
+        except (OSError, TypeError):
+            return True
+
+        return 'ram_release_callback' in source and 'self.cache_type == CacheType.RAM_PRESSURE' in source
 
     def _set_executor_cache_type(self, executor, target_mode_ram):
         CacheType = getattr(execution, 'CacheType', None)
